@@ -1,0 +1,758 @@
+---
+title: "Allometry of fitness traits and temperature in hydra - analysis of gene expression data"
+author: "Jácint Tökölyi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+first_part <- FALSE
+
+library(DESeq2); library(ggplot2); library(dplyr); library(EnhancedVolcano); library(ggpubr); 
+library(ComplexUpset); library(ComplexHeatmap); library(topGO); library(clusterProfiler); 
+library(GO.db); library(GOSim); library(KEGGREST); library(simplifyEnrichment); library(Biostrings);
+library(goseq); library(circlize); library(colorspace); 
+library(patchwork); library(ragg); library(ggplotify); library(magick)
+
+x <- read.csv("~/hidra/2023/TempAllometry/diff_expr/ts2.isoform.counts.matrix",sep="\t")
+
+fm <- x[,c(1, grep("FM",names(x)))]
+fx <- x[,c(1, grep("FX",names(x)))]
+mm <- x[,c(1, grep("MM",names(x)))]
+mc <- x[,c(1, grep("MC",names(x)))]
+
+fm.dat <- data.frame(sampleID = names(fm)[-1],
+                    TEMPgroup = ifelse(grepl("12", names(fm[-1])), "12", "8"),
+                    SMgroup = ifelse(grepl("R", names(fm[-1])), "R", "E"))
+fm.dat$Group <- paste(fm.dat$TEMPgroup, fm.dat$SMgroup, sep="-")
+fx.dat <- data.frame(sampleID = names(fx)[-1],
+                    TEMPgroup = ifelse(grepl("12", names(fx[-1])), "12", "8"),
+                    SMgroup = ifelse(grepl("R", names(fx[-1])), "R", "E"))
+fx.dat$Group <- paste(fx.dat$TEMPgroup, fx.dat$SMgroup, sep="-")
+mm.dat <- data.frame(sampleID = names(mm)[-1],
+                    TEMPgroup = ifelse(grepl("12", names(mm[-1])), "12", "8"),
+                    SMgroup = ifelse(grepl("R", names(mm[-1])), "R", "E"))
+mm.dat$Group <- paste(mm.dat$TEMPgroup, mm.dat$SMgroup, sep="-")
+mc.dat <- data.frame(sampleID = names(mc)[-1],
+                    TEMPgroup = ifelse(grepl("12", names(mc[-1])), "12", "8"),
+                    SMgroup = ifelse(grepl("R", names(mc[-1])), "R", "E"))
+mc.dat$Group <- paste(mc.dat$TEMPgroup, mc.dat$SMgroup, sep="-")
+
+row.names(fm) <- fm[,1]; fm <- round(fm[,-1])
+row.names(fx) <- fx[,1]; fx <- round(fx[,-1])
+row.names(mm) <- mm[,1]; mm <- round(mm[,-1])
+row.names(mc) <- mc[,1]; mc <- round(mc[,-1])
+
+go_terms <- read.table(file="~/hidra/2023/TempAllometry/diff_expr/go_transcript_withancestral.txt",sep="\t")
+go_list <- strsplit(go_terms[,2], split=","); names(go_list)<-go_terms[,1]
+
+#term2gene <- data.frame(id = unlist(go_list),
+#                        gene =rep(names(go_list), times=sapply(go_list, length)))
+#term2gene$term <- Term(term2gene$id)
+
+ts2.fasta <- readDNAStringSet("~/hidra/2023/TempAllometry/ts2_trinity.Trinity.fasta")
+seq.len = data.frame(length=width(ts2.fasta),
+                     name=sapply(sapply(lapply(names(ts2.fasta), strsplit, split=" "),"[",1),"[",1))
+rm(ts2.fasta)
+
+trin <- read.csv("~/hidra/2023/TempAllometry/Trinotate_final.xls", na.strings=".",sep="\t")
+trin <- trin[!duplicated(trin$transcript_id),]
+kegg.list <- na.omit(trin[c("transcript_id","EggNM.KEGG_ko")])
+kegg.list$EggNM.KEGG_ko <- gsub("ko:","",kegg.list$EggNM.KEGG_ko)
+keggK <- strsplit(kegg.list$EggNM.KEGG_ko, split=","); names(keggK) <- kegg.list$transcript_id
+kegg.path <- lapply(keggK, function(i) bitr_kegg(geneID=i, "kegg", "Path", "ko"))
+kegg.path <- kegg.path[sapply(kegg.path, nrow)>0]
+
+met.kegg <- lapply(kegg.path, function(i) i[as.numeric(gsub("ko","",i$Path))%in%c(1:1099, 1101:1500, 4970:4979),])
+met.kegg <- met.kegg[sapply(met.kegg, nrow)>0]
+
+kegg.names <- keggList("pathway"); names(kegg.names) <- gsub("map","ko",names(kegg.names))
+#rm(x,trin)
+
+```
+## Run DESeq2
+```{r message=FALSE, warning=FALSE}
+fm.dds <- DESeqDataSetFromMatrix(countData = fm,
+                              colData = fm.dat,
+                              design= ~ Group)
+fm.dds <- fm.dds[rowSums(counts(fm.dds)>=10) >=3,]
+fm.res <- DESeq(fm.dds)
+
+fx.dds <- DESeqDataSetFromMatrix(countData = fx,
+                              colData = fx.dat,
+                              design= ~ Group)
+fx.dds <- fx.dds[rowSums(counts(fx.dds)>=10) >=3,]
+fx.res <- DESeq(fx.dds)
+
+mm.dds <- DESeqDataSetFromMatrix(countData = mm,
+                              colData = mm.dat,
+                              design= ~ Group)
+mm.dds <- mm.dds[rowSums(counts(mm.dds)>=10) >=3,]
+mm.res <- DESeq(mm.dds)
+
+mc.dds <- DESeqDataSetFromMatrix(countData = mc,
+                              colData = mc.dat,
+                              design= ~ Group)
+mc.dds <- mc.dds[rowSums(counts(mc.dds)>=10) >=3,]
+mc.res <- DESeq(mc.dds)
+
+#save(fm.res, fx.res, mm.res, mc.res, file="deseq2_output.Rdata")
+```
+### FM
+```{r fm}
+
+## negative values mean downregulation in the first category
+fm_res2 <- lfcShrink(fm.res, coef = "Group_12.R_vs_12.E", type="apeglm")
+fm_res2 <- fm_res2%>%data.frame()
+fm_res2$seqID <- row.names(fm_res2)
+fm_res2$seqLen <- left_join(fm_res2, seq.len, join_by(seqID==name)) %>% pull(length)
+
+fm.dds$Group <- relevel(fm.dds$Group, "8-E")
+fm.res <- DESeq(fm.dds)
+fm_res1 <- lfcShrink(fm.res, coef = "Group_8.R_vs_8.E", type="apeglm")
+fm_res1 <- fm_res1%>%data.frame()
+fm_res1$seqID <- row.names(fm_res1)
+fm_res1$seqLen <- left_join(fm_res1, seq.len, join_by(seqID==name)) %>% pull(length)
+
+if(first_part){
+fm.v8 <- EnhancedVolcano(fm_res1, x="log2FoldChange", y="pvalue", lab="",,legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("M26/9/10 Red. vs. Enl. 8", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","blue"),
+                      FCcutoff=1,pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+fm.v12 <- EnhancedVolcano(fm_res2, x="log2FoldChange", y="pvalue", lab="",legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("M26/9/10 Red. vs. Enl. 12", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","red"),
+                      FCcutoff=1,pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+sm.upDEGs.8degrees <- row.names(fm_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.8degrees <- row.names(fm_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+sm.upDEGs.12degrees <- row.names(fm_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.12degrees <- row.names(fm_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+
+fm.DEGs <- as.data.frame(list_to_matrix(list(upregulated8 = sm.upDEGs.8degrees, 
+                        downregulated8 = sm.downDEGs.8degrees, 
+                      upregulated12 = sm.upDEGs.12degrees, 
+                     downregulated12 = sm.downDEGs.12degrees)))
+
+fm.upset <- upset(fm.DEGs, names(fm.DEGs),sort_intersections=F,sort_sets=F, set_sizes = F,wrap=F,
+      intersections =list("downregulated8", "upregulated8",
+                          c("downregulated8","downregulated12"),
+                          c("upregulated8","upregulated12"),
+                          "downregulated12", "upregulated12",
+                          c("upregulated8","downregulated12"),
+                          c("downregulated8","upregulated12")),
+      queries=list(
+        upset_query(intersect = "upregulated8",fill="blue"),
+        upset_query(intersect = "downregulated8",fill="blue"),
+        upset_query(intersect = "upregulated12",fill="red"),
+        upset_query(intersect = "downregulated12",fill="red"),
+        upset_query(set = "upregulated8",fill="blue"),
+        upset_query(set = "downregulated8",fill="blue"),
+        upset_query(set = "upregulated12",fill="red"),
+        upset_query(set = "downregulated12",fill="red")),
+      labeller=as_labeller(c(
+        'upregulated8'="UP 8 °C",
+        'downregulated8'="DOWN 8 °C",
+        'upregulated12'= "UP 12 °C",
+        'downregulated12'= "DOWN 12 °C")))+
+  plot_annotation(title="M26/9/10",theme = theme(plot.title = element_text(hjust = 0.5)))
+
+mat <- as.matrix(log(fm[,c(10:12,7:9,4:6,1:3)][row.names(results(fm.res)%>%data.frame()%>%filter(padj<0.05 & abs(log2FoldChange)>1)),]+1))
+
+ha <- HeatmapAnnotation(TEMPgroup=anno_block(labels=c("8","8","12","12"),gp=gpar(fill=c("blue","blue","red","red"))),
+                        SMgroup=anno_block(labels=c("Red.","Enl.","Red.","Enl.")))
+                        
+col_fun <- colorRamp2(quantile(mat,c(0.005,0.5,0.995)), diverging_hcl(n=3,"Blue-Red 3"))
+
+fm.hm <- grid.grabExpr(draw(Heatmap(mat,column_split = rep(1:4,each=3),column_gap = unit(0.1,"mm"),
+                                    show_row_names = F, show_column_names=F, cluster_columns = F,
+                                    top_annotation=ha, col=col_fun, column_title="M26/9/10",
+                                    heatmap_legend_param = list(title="Expr:"))))
+} else {
+
+fm.term2gene <- go_list[names(go_list)%in%row.names(fm.dds)]
+
+sm8.GenesDown <- as.integer(fm_res1$padj<0.05 & fm_res1$log2FoldChange < -1); 
+sm8.GenesDown[is.na(sm8.GenesDown)]<-0; 
+names(sm8.GenesDown) <- fm_res1$seqID
+pwf <- nullp(sm8.GenesDown, bias.data = fm_res1$seqLen)
+fm.go.down8 <- goseq(pwf, gene2cat = fm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fm.go.down8$over_represented_padj <- p.adjust(fm.go.down8$over_represented_pvalue, "BH")
+
+sm8.GenesUp <- as.integer(fm_res1$padj<0.05 & fm_res1$log2FoldChange > 1);
+sm8.GenesUp[is.na(sm8.GenesUp)]<-0;
+names(sm8.GenesUp) <- fm_res1$seqID
+pwf <- nullp(sm8.GenesUp, bias.data = fm_res1$seqLen)
+fm.go.up8 <- goseq(pwf, gene2cat = fm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fm.go.up8$over_represented_padj <- p.adjust(fm.go.up8$over_represented_pvalue, "BH")
+
+sm12.GenesDown <- as.integer(fm_res2$padj<0.05 & fm_res1$log2FoldChange < -1); 
+sm12.GenesDown[is.na(sm12.GenesDown)]<-0; 
+names(sm12.GenesDown) <- fm_res2$seqID
+pwf <- nullp(sm12.GenesDown, bias.data = fm_res2$seqLen)
+fm.go.down12 <- goseq(pwf, gene2cat = fm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fm.go.down12$over_represented_padj <- p.adjust(fm.go.down12$over_represented_pvalue, "BH")
+
+sm12.GenesUp <- as.integer(fm_res2$padj<0.05 & fm_res1$log2FoldChange > 1);
+sm12.GenesUp[is.na(sm12.GenesUp)]<-0;
+names(sm12.GenesUp) <- fm_res2$seqID
+pwf <- nullp(sm12.GenesUp, bias.data = fm_res2$seqLen)
+fm.go.up12 <- goseq(pwf, gene2cat = fm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fm.go.up12$over_represented_padj <- p.adjust(fm.go.up12$over_represented_pvalue, "BH")
+
+fm.lt <- list(fm.go.down8, fm.go.down12, fm.go.up8, fm.go.up12); names(fm.lt) <- c("DOWN8","DOWN12", "UP8", "UP12")
+#sgo.out <- simplifyGOFromMultipleLists(lt,ont="BP",padj_cutoff = 0.05,
+#                            go_id_column = "category", padj_column = "over_represented_padj",
+#                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")))
+
+fm.met.kegg.list <- lapply(met.kegg[names(met.kegg)%in%row.names(fm.dds)],"[[",2)
+
+pwf <- nullp(sm8.GenesDown, bias.data = fm_res1$seqLen)
+fm.kegg.down8 <- goseq(pwf, gene2cat = fm.met.kegg.list,test.cats=c("KEGG"))
+fm.kegg.down8$over_represented_padj <- p.adjust(fm.kegg.down8$over_represented_pvalue, "BH")
+fm.kegg.down8$pathname <- kegg.names[fm.kegg.down8$category]
+fm.kegg.down8 <- fm.kegg.down8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm8.GenesUp, bias.data = fm_res1$seqLen)
+fm.kegg.up8 <- goseq(pwf, gene2cat = fm.met.kegg.list,test.cats=c("KEGG"))
+fm.kegg.up8$over_represented_padj <- p.adjust(fm.kegg.up8$over_represented_pvalue, "BH")
+fm.kegg.up8$pathname <- kegg.names[fm.kegg.up8$category]
+fm.kegg.up8 <- fm.kegg.up8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesDown, bias.data = fm_res2$seqLen)
+fm.kegg.down12 <- goseq(pwf, gene2cat = fm.met.kegg.list,test.cats=c("KEGG"))
+fm.kegg.down12$over_represented_padj <- p.adjust(fm.kegg.down12$over_represented_pvalue, "BH")
+fm.kegg.down12$pathname <- kegg.names[fm.kegg.down12$category]
+fm.kegg.down12 <- fm.kegg.down12%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesUp, bias.data = fm_res2$seqLen)
+fm.kegg.up12 <- goseq(pwf, gene2cat = fm.met.kegg.list,test.cats=c("KEGG"))
+fm.kegg.up12$over_represented_padj <- p.adjust(fm.kegg.up12$over_represented_pvalue, "BH")
+fm.kegg.up12$pathname <- kegg.names[fm.kegg.up12$category]
+fm.kegg.up12 <- fm.kegg.up12%>%filter(over_represented_padj<0.05)
+
+fm.kegg.up8$type <- "UP8"
+fm.kegg.up12$type <- "UP12"
+fm.kegg.down8$type <- "DOWN8"
+#fm.kegg.down12$type <- "DOWN12"
+fm.kegg <- rbind(fm.kegg.down8, fm.kegg.up8, fm.kegg.down12, fm.kegg.up12)
+fm.kegg$GeneRatio <- fm.kegg$numDEInCat / fm.kegg$numInCat
+fm.kegg$TEMPgroup <- ifelse(fm.kegg$type%in%c("UP8","DOWN8"),8,12)
+fm.kegg$updown <- ifelse(fm.kegg$type%in%c("UP8","UP12"),"UP","DOWN")
+fm.kegg$Strain <- "M26/9/10"
+}
+```
+### FX
+```{r fx}
+fx_res2 <- lfcShrink(fx.res, coef = "Group_12.R_vs_12.E", type="apeglm")
+fx_res2 <- fx_res2%>%data.frame()
+fx_res2$seqID <- row.names(fx_res2)
+fx_res2$seqLen <- left_join(fx_res2, seq.len, join_by(seqID==name)) %>% pull(length)
+
+fx.dds$Group <- relevel(fx.dds$Group, "8-E")
+fx.res <- DESeq(fx.dds)
+fx_res1 <- lfcShrink(fx.res, coef = "Group_8.R_vs_8.E", type="apeglm")
+fx_res1 <- fx_res1%>%data.frame()
+fx_res1$seqID <- row.names(fx_res1)
+fx_res1$seqLen <- left_join(fx_res1, seq.len, join_by(seqID==name)) %>% pull(length)
+
+if(first_part){
+fx.v8 <- EnhancedVolcano(fx_res1, x="log2FoldChange", y="pvalue", lab="",,legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("X11/14 Red. vs. Enl. 8", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","blue"),
+                      FCcutoff=1, pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+fx.v12 <- EnhancedVolcano(fx_res2, x="log2FoldChange", y="pvalue", lab="",legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("X11/14 Red. vs. Enl. 12", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","red"),
+                      FCcutoff=1, pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+sm.upDEGs.8degrees <- row.names(fx_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.8degrees <- row.names(fx_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+sm.upDEGs.12degrees <- row.names(fx_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.12degrees <- row.names(fx_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+
+fx.DEGs <- as.data.frame(list_to_matrix(list(upregulated8 = sm.upDEGs.8degrees, 
+                        downregulated8 = sm.downDEGs.8degrees, 
+                      upregulated12 = sm.upDEGs.12degrees, 
+                     downregulated12 = sm.downDEGs.12degrees)))
+
+fx.upset <- upset(fx.DEGs, names(fx.DEGs),sort_intersections=F,sort_sets=F,set_sizes = F,wrap=F,
+      intersections =list("downregulated8", "upregulated8",
+                          c("downregulated8","downregulated12"),
+                          c("upregulated8","upregulated12"),
+                          "downregulated12", "upregulated12",
+                          c("upregulated8","downregulated12"),
+                          c("downregulated8","upregulated12")),
+      queries=list(
+        upset_query(intersect = "upregulated8",fill="blue"),
+        upset_query(intersect = "downregulated8",fill="blue"),
+        upset_query(intersect = "upregulated12",fill="red"),
+        upset_query(intersect = "downregulated12",fill="red"),
+        upset_query(set = "upregulated8",fill="blue"),
+        upset_query(set = "downregulated8",fill="blue"),
+        upset_query(set = "upregulated12",fill="red"),
+        upset_query(set = "downregulated12",fill="red")),
+      labeller=as_labeller(c(
+        'upregulated8'="UP 8 °C",
+        'downregulated8'="DOWN 8 °C",
+        'upregulated12'= "UP 12 °C",
+        'downregulated12'= "DOWN 12 °C")))+
+  plot_annotation(title="X11/14",theme = theme(plot.title = element_text(hjust = 0.5)))
+
+mat <- as.matrix(log(fx[,c(10:12,7:9,4:6,1:3)][row.names(results(fx.res)%>%data.frame()%>%filter(padj<0.05 & abs(log2FoldChange)>1)),]+1))
+
+ha <- HeatmapAnnotation(TEMPgroup=anno_block(labels=c("8","8","12","12"),gp=gpar(fill=c("blue","blue","red","red"))),
+                        SMgroup=anno_block(labels=c("Red.","Enl.","Red.","Enl.")))
+                        
+col_fun <- colorRamp2(quantile(mat,c(0.005,0.5,0.995)), diverging_hcl(n=3,"Blue-Red 3"))
+
+fx.hm <- grid.grabExpr(draw(Heatmap(mat,column_split = rep(1:4,each=3),column_gap = unit(0.1,"mm"),
+                                    show_row_names = F, show_column_names=F, cluster_columns = F,
+                                    top_annotation=ha, col=col_fun, column_title="X11/14",
+                                    heatmap_legend_param = list(title="Expr:"))))
+
+} else {
+
+fx.term2gene <- go_list[names(go_list)%in%row.names(fx.dds)]
+
+sm8.GenesDown <- as.integer(fx_res1$padj<0.05 & fx_res1$log2FoldChange < -1); 
+sm8.GenesDown[is.na(sm8.GenesDown)]<-0; 
+names(sm8.GenesDown) <- fx_res1$seqID
+pwf <- nullp(sm8.GenesDown, bias.data = fx_res1$seqLen)
+fx.go.down8 <- goseq(pwf, gene2cat = fx.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fx.go.down8$over_represented_padj <- p.adjust(fx.go.down8$over_represented_pvalue, "BH")
+
+sm8.GenesUp <- as.integer(fx_res1$padj<0.05 & fx_res1$log2FoldChange > 1);
+sm8.GenesUp[is.na(sm8.GenesUp)]<-0;
+names(sm8.GenesUp) <- fx_res1$seqID
+pwf <- nullp(sm8.GenesUp, bias.data = fx_res1$seqLen)
+fx.go.up8 <- goseq(pwf, gene2cat = fx.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fx.go.up8$over_represented_padj <- p.adjust(fx.go.up8$over_represented_pvalue, "BH")
+
+sm12.GenesDown <- as.integer(fx_res2$padj<0.05 & fx_res1$log2FoldChange < -1); 
+sm12.GenesDown[is.na(sm12.GenesDown)]<-0; 
+names(sm12.GenesDown) <- fx_res2$seqID
+pwf <- nullp(sm12.GenesDown, bias.data = fx_res2$seqLen)
+fx.go.down12 <- goseq(pwf, gene2cat = fx.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fx.go.down12$over_represented_padj <- p.adjust(fx.go.down12$over_represented_pvalue, "BH")
+
+sm12.GenesUp <- as.integer(fx_res2$padj<0.05 & fx_res1$log2FoldChange > 1);
+sm12.GenesUp[is.na(sm12.GenesUp)]<-0;
+names(sm12.GenesUp) <- fx_res2$seqID
+pwf <- nullp(sm12.GenesUp, bias.data = fx_res2$seqLen)
+fx.go.up12 <- goseq(pwf, gene2cat = fx.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+fx.go.up12$over_represented_padj <- p.adjust(fx.go.up12$over_represented_pvalue, "BH")
+
+
+fx.lt <- list(fx.go.down8, fx.go.down12, fx.go.up8, fx.go.up12); names(fx.lt) <- c("DOWN8","DOWN12", "UP8", "UP12")
+#simplifyGOFromMultipleLists(lt,ont="BP",padj_cutoff = 0.05,
+#                            go_id_column = "category", padj_column = "over_represented_padj",
+#                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")))
+
+fx.met.kegg.list <- lapply(met.kegg[names(met.kegg)%in%row.names(fx.dds)],"[[",2)
+
+pwf <- nullp(sm8.GenesDown, bias.data = fx_res1$seqLen)
+fx.kegg.down8 <- goseq(pwf, gene2cat = fx.met.kegg.list,test.cats=c("KEGG"))
+fx.kegg.down8$over_represented_padj <- p.adjust(fx.kegg.down8$over_represented_pvalue, "BH")
+fx.kegg.down8$pathname <- kegg.names[fx.kegg.down8$category]
+fx.kegg.down8 <- fx.kegg.down8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm8.GenesUp, bias.data = fx_res1$seqLen)
+fx.kegg.up8 <- goseq(pwf, gene2cat = fx.met.kegg.list,test.cats=c("KEGG"))
+fx.kegg.up8$over_represented_padj <- p.adjust(fx.kegg.up8$over_represented_pvalue, "BH")
+fx.kegg.up8$pathname <- kegg.names[fx.kegg.up8$category]
+fx.kegg.up8 <- fx.kegg.up8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesDown, bias.data = fx_res2$seqLen)
+fx.kegg.down12 <- goseq(pwf, gene2cat = fx.met.kegg.list,test.cats=c("KEGG"))
+fx.kegg.down12$over_represented_padj <- p.adjust(fx.kegg.down12$over_represented_pvalue, "BH")
+fx.kegg.down12$pathname <- kegg.names[fx.kegg.down12$category]
+fx.kegg.down12 <- fx.kegg.down12%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesUp, bias.data = fx_res2$seqLen)
+fx.kegg.up12 <- goseq(pwf, gene2cat = fx.met.kegg.list,test.cats=c("KEGG"))
+fx.kegg.up12$over_represented_padj <- p.adjust(fx.kegg.up12$over_represented_pvalue, "BH")
+fx.kegg.up12$pathname <- kegg.names[fx.kegg.up12$category]
+fx.kegg.up12 <- fx.kegg.up12%>%filter(over_represented_padj<0.05)
+
+fx.kegg.up8$type <- "UP8"
+fx.kegg.up12$type <- "UP12"
+fx.kegg.down8$type <- "DOWN8"
+fx.kegg.down12$type <- "DOWN12"
+fx.kegg <- rbind(fx.kegg.down8, fx.kegg.up8, fx.kegg.down12, fx.kegg.up12)
+fx.kegg$GeneRatio <- fx.kegg$numDEInCat / fx.kegg$numInCat
+fx.kegg$TEMPgroup <- ifelse(fx.kegg$type%in%c("UP8","DOWN8"),8,12)
+fx.kegg$updown <- ifelse(fx.kegg$type%in%c("UP8","UP12"),"UP","DOWN")
+fx.kegg$Strain <- "X11/14"
+
+f.kegg <- rbind(fm.kegg, fx.kegg)
+f.kegg$Temperature <- as.factor(f.kegg$TEMPgroup)
+f.kegg$updown <- factor(f.kegg$updown, levels=c("UP","DOWN"))
+f.kegg.plot <- ggplot(f.kegg, aes(y=reorder(pathname, GeneRatio, mean), x=GeneRatio,shape=Strain))+
+  geom_point(position=position_dodge(0.5), aes(size=over_represented_padj,fill=Temperature),color="black",alpha=0.75) + facet_wrap(~updown)+scale_size(trans="reverse")+theme_bw()+scale_fill_manual(values=c("8"="blue","12"="red"))+
+  ylab("KEGG metabolic pathway")+ggtitle("Female strains")
+ 
+}
+```
+
+### MM
+```{r mm}
+mm_res2 <- lfcShrink(mm.res, coef = "Group_12.R_vs_12.E", type="apeglm")
+mm_res2 <- mm_res2%>%data.frame()
+mm_res2$seqID <- row.names(mm_res2)
+mm_res2$seqLen <- left_join(mm_res2, seq.len, join_by(seqID==name)) %>% pull(length)
+
+mm.dds$Group <- relevel(mm.dds$Group, "8-E")
+mm.res <- DESeq(mm.dds)
+mm_res1 <- lfcShrink(mm.res, coef = "Group_8.R_vs_8.E", type="apeglm")
+mm_res1 <- mm_res1%>%data.frame()
+mm_res1$seqID <- row.names(mm_res1)
+mm_res1$seqLen <- left_join(mm_res1, seq.len, join_by(seqID==name)) %>% pull(length)
+
+if(first_part){
+mm.v8 <- EnhancedVolcano(mm_res1, x="log2FoldChange", y="pvalue", lab="",,legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("M83/4 Red. vs. Enl. 8", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","blue"),
+                      FCcutoff=1, pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,4,0,12),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+mm.v12 <- EnhancedVolcano(mm_res2, x="log2FoldChange", y="pvalue", lab="",legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("M83/4 Red. vs. Enl. 12", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","red"),
+                      FCcutoff=1, pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+sm.upDEGs.8degrees <- row.names(mm_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.8degrees <- row.names(mm_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+sm.upDEGs.12degrees <- row.names(mm_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.12degrees <- row.names(mm_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+
+mm.DEGs <- as.data.frame(list_to_matrix(list(upregulated8 = sm.upDEGs.8degrees, 
+                        downregulated8 = sm.downDEGs.8degrees, 
+                      upregulated12 = sm.upDEGs.12degrees, 
+                     downregulated12 = sm.downDEGs.12degrees)))
+
+mm.upset <- upset(mm.DEGs, names(mm.DEGs),sort_intersections=F,sort_sets=F,set_sizes = F, 
+      intersections =list("downregulated8", "upregulated8",
+                          c("downregulated8","downregulated12"),
+                          c("upregulated8","upregulated12"),
+                          "downregulated12", "upregulated12",
+                          c("upregulated8","downregulated12"),
+                          c("downregulated8","upregulated12")),
+      queries=list(
+        upset_query(intersect = "upregulated8",fill="blue"),
+        upset_query(intersect = "downregulated8",fill="blue"),
+        upset_query(intersect = "upregulated12",fill="red"),
+        upset_query(intersect = "downregulated12",fill="red"),
+        upset_query(set = "upregulated8",fill="blue"),
+        upset_query(set = "downregulated8",fill="blue"),
+        upset_query(set = "upregulated12",fill="red"),
+        upset_query(set = "downregulated12",fill="red")),
+      labeller=as_labeller(c(
+        'upregulated8'="UP 8 °C",
+        'downregulated8'="DOWN 8 °C",
+        'upregulated12'= "UP 12 °C",
+        'downregulated12'= "DOWN 12 °C")))+
+  plot_annotation(title="M83/4",theme = theme(plot.title = element_text(hjust = 0.5)))
+
+mat <- as.matrix(log(mm[,c(10:12,7:9,4:6,1:3)][row.names(results(mm.res)%>%data.frame()%>%filter(padj<0.05 & abs(log2FoldChange)>1)),]+1))
+
+ha <- HeatmapAnnotation(TEMPgroup=anno_block(labels=c("8","8","12","12"),gp=gpar(fill=c("blue","blue","red","red"))),
+                        SMgroup=anno_block(labels=c("Red.","Enl.","Red.","Enl.")))
+                        
+col_fun <- colorRamp2(quantile(mat,c(0.005,0.5,0.995)), diverging_hcl(n=3,"Blue-Red 3"))
+
+mm.hm <- grid.grabExpr(draw(Heatmap(mat,column_split = rep(1:4,each=3),column_gap = unit(0.1,"mm"),
+                                    show_row_names = F, show_column_names=F, cluster_columns = F,
+                                    top_annotation=ha, col=col_fun, column_title="M83/4",
+                                    heatmap_legend_param = list(title="Expr:"))))
+} else {
+mm.term2gene <- go_list[names(go_list)%in%row.names(mm.dds)]
+
+sm8.GenesDown <- as.integer(mm_res1$padj<0.05 & mm_res1$log2FoldChange < -1); 
+sm8.GenesDown[is.na(sm8.GenesDown)]<-0; 
+names(sm8.GenesDown) <- mm_res1$seqID
+pwf <- nullp(sm8.GenesDown, bias.data = mm_res1$seqLen)
+mm.go.down8 <- goseq(pwf, gene2cat = mm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mm.go.down8$over_represented_padj <- p.adjust(mm.go.down8$over_represented_pvalue, "BH")
+
+sm8.GenesUp <- as.integer(mm_res1$padj<0.05 & mm_res1$log2FoldChange > 1);
+sm8.GenesUp[is.na(sm8.GenesUp)]<-0;
+names(sm8.GenesUp) <- mm_res1$seqID
+pwf <- nullp(sm8.GenesUp, bias.data = mm_res1$seqLen)
+mm.go.up8 <- goseq(pwf, gene2cat = mm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mm.go.up8$over_represented_padj <- p.adjust(mm.go.up8$over_represented_pvalue, "BH")
+
+sm12.GenesDown <- as.integer(mm_res2$padj<0.05 & mm_res1$log2FoldChange < -1); 
+sm12.GenesDown[is.na(sm12.GenesDown)]<-0; 
+names(sm12.GenesDown) <- mm_res2$seqID
+pwf <- nullp(sm12.GenesDown, bias.data = mm_res2$seqLen)
+mm.go.down12 <- goseq(pwf, gene2cat = mm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mm.go.down12$over_represented_padj <- p.adjust(mm.go.down12$over_represented_pvalue, "BH")
+
+sm12.GenesUp <- as.integer(mm_res2$padj<0.05 & mm_res1$log2FoldChange > 1);
+sm12.GenesUp[is.na(sm12.GenesUp)]<-0;
+names(sm12.GenesUp) <- mm_res2$seqID
+pwf <- nullp(sm12.GenesUp, bias.data = mm_res2$seqLen)
+mm.go.up12 <- goseq(pwf, gene2cat = mm.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mm.go.up12$over_represented_padj <- p.adjust(mm.go.up12$over_represented_pvalue, "BH")
+
+mm.lt <- list(mm.go.down8, mm.go.down12, mm.go.up8, mm.go.up12); names(mm.lt) <- c("DOWN8","DOWN12", "UP8", "UP12")
+#sgo.out <- simplifyGOFromMultipleLists(lt,ont="BP",padj_cutoff = 0.05,
+#                            go_id_column = "category", padj_column = "over_represented_padj",
+#                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")))
+
+mm.met.kegg.list <- lapply(met.kegg[names(met.kegg)%in%row.names(mm.dds)],"[[",2)
+
+pwf <- nullp(sm8.GenesDown, bias.data = mm_res1$seqLen)
+mm.kegg.down8 <- goseq(pwf, gene2cat = mm.met.kegg.list,test.cats=c("KEGG"))
+mm.kegg.down8$over_represented_padj <- p.adjust(mm.kegg.down8$over_represented_pvalue, "BH")
+mm.kegg.down8$pathname <- kegg.names[mm.kegg.down8$category]
+mm.kegg.down8 <- mm.kegg.down8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm8.GenesUp, bias.data = mm_res1$seqLen)
+mm.kegg.up8 <- goseq(pwf, gene2cat = mm.met.kegg.list,test.cats=c("KEGG"))
+mm.kegg.up8$over_represented_padj <- p.adjust(mm.kegg.up8$over_represented_pvalue, "BH")
+mm.kegg.up8$pathname <- kegg.names[mm.kegg.up8$category]
+mm.kegg.up8 <- mm.kegg.up8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesDown, bias.data = mm_res2$seqLen)
+mm.kegg.down12 <- goseq(pwf, gene2cat = mm.met.kegg.list,test.cats=c("KEGG"))
+mm.kegg.down12$over_represented_padj <- p.adjust(mm.kegg.down12$over_represented_pvalue, "BH")
+mm.kegg.down12$pathname <- kegg.names[mm.kegg.down12$category]
+mm.kegg.down12 <- mm.kegg.down12%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesUp, bias.data = mm_res2$seqLen)
+mm.kegg.up12 <- goseq(pwf, gene2cat = mm.met.kegg.list,test.cats=c("KEGG"))
+mm.kegg.up12$over_represented_padj <- p.adjust(mm.kegg.up12$over_represented_pvalue, "BH")
+mm.kegg.up12$pathname <- kegg.names[mm.kegg.up12$category]
+mm.kegg.up12 <- mm.kegg.up12%>%filter(over_represented_padj<0.05)
+
+mm.kegg.up8$type <- "UP8"
+#mm.kegg.up12$type <- "UP12"
+mm.kegg.down8$type <- "DOWN8"
+#mm.kegg.down12$type <- "DOWN12"
+mm.kegg <- rbind(mm.kegg.down8, mm.kegg.up8, mm.kegg.down12, mm.kegg.up12)
+mm.kegg$GeneRatio <- mm.kegg$numDEInCat / mm.kegg$numInCat
+mm.kegg$TEMPgroup <- ifelse(mm.kegg$type%in%c("UP8","DOWN8"),8,12)
+mm.kegg$updown <- ifelse(mm.kegg$type%in%c("UP8","UP12"),"UP","DOWN")
+mm.kegg$Strain <- "M83/4"
+
+}
+```
+
+
+### MC
+```{r mc}
+mc_res2 <- lfcShrink(mc.res, coef = "Group_12.R_vs_12.E", type="apeglm")
+mc_res2 <- mc_res2%>%data.frame()
+mc_res2$seqID <- row.names(mc_res2)
+mc_res2$seqLen <- left_join(mc_res2, seq.len, join_by(seqID==name)) %>% pull(length)
+
+mc.dds$Group <- relevel(mc.dds$Group, "8-E")
+mc.res <- DESeq(mc.dds)
+mc_res1 <- lfcShrink(mc.res, coef = "Group_8.R_vs_8.E", type="apeglm")
+mc_res1 <- mc_res1%>%data.frame()
+mc_res1$seqID <- row.names(mc_res1)
+mc_res1$seqLen <- left_join(mc_res1, seq.len, join_by(seqID==name)) %>% pull(length)
+
+if(first_part){
+mc.v8 <- EnhancedVolcano(mc_res1, x="log2FoldChange", y="pvalue", lab="",,legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("C2/7 Red. vs. Enl. 8", ~degree, "C")), 
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","blue"),
+                      FCcutoff=1,pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+mc.v12 <- EnhancedVolcano(mc_res2, x="log2FoldChange", y="pvalue", lab="",legendPosition = "none",caption="",
+                      axisLabSize = 10, subtitleLabSize = 10,captionLabSize=10,
+                      subtitle=expression(paste("C2/7 Red. vs. Enl. 12", ~degree, "C")),
+                      title="",colAlpha = 0.25, col=c("grey","grey","grey","red"),
+                      FCcutoff=1,pCutoff=0.05)+xlim(-15,15)+ylim(0,30)+theme(plot.title = element_blank()) + theme(plot.margin=unit(c(0,12,0,2),"pt"), plot.subtitle = element_text(hjust=0.5))
+
+sm.upDEGs.8degrees <- row.names(mc_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.8degrees <- row.names(mc_res1 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+sm.upDEGs.12degrees <- row.names(mc_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange > 1))
+sm.downDEGs.12degrees <- row.names(mc_res2 %>% data.frame() %>% filter(padj<0.05 & log2FoldChange < -1))
+
+mc.DEGs <- as.data.frame(list_to_matrix(list(upregulated8 = sm.upDEGs.8degrees, 
+                        downregulated8 = sm.downDEGs.8degrees, 
+                      upregulated12 = sm.upDEGs.12degrees, 
+                     downregulated12 = sm.downDEGs.12degrees)))
+
+mc.upset <- upset(mc.DEGs, names(mc.DEGs),sort_intersections=F,sort_sets=F, set_sizes=F,
+      intersections =list("downregulated8", "upregulated8",
+                          c("downregulated8","downregulated12"),
+                          c("upregulated8","upregulated12"),
+                          "downregulated12", "upregulated12",
+                          c("upregulated8","downregulated12"),
+                          c("downregulated8","upregulated12")),
+      queries=list(
+        upset_query(intersect = "upregulated8",fill="blue"),
+        upset_query(intersect = "downregulated8",fill="blue"),
+        upset_query(intersect = "upregulated12",fill="red"),
+        upset_query(intersect = "downregulated12",fill="red"),
+        upset_query(set = "upregulated8",fill="blue"),
+        upset_query(set = "downregulated8",fill="blue"),
+        upset_query(set = "upregulated12",fill="red"),
+        upset_query(set = "downregulated12",fill="red")),
+      labeller=as_labeller(c(
+        'upregulated8'="UP 8 °C",
+        'downregulated8'="DOWN 8 °C",
+        'upregulated12'= "UP 12 °C",
+        'downregulated12'= "DOWN 12 °C")))+
+  plot_annotation(title="C2/7",theme = theme(plot.title = element_text(hjust = 0.5)))
+
+mat <- as.matrix(log(mc[,c(10:12,7:9,4:6,1:3)][row.names(results(mc.res)%>%data.frame()%>%filter(padj<0.05 & abs(log2FoldChange)>1)),]+1))
+
+ha <- HeatmapAnnotation(TEMPgroup=anno_block(labels=c("8","8","12","12"),gp=gpar(fill=c("blue","blue","red","red"))),
+                        SMgroup=anno_block(labels=c("Red.","Enl.","Red.","Enl.")))
+                        
+col_fun <- colorRamp2(quantile(mat,c(0.005,0.5,0.995)), diverging_hcl(n=3,"Blue-Red 3"))
+
+mc.hm <- grid.grabExpr(draw(Heatmap(mat,column_split = rep(1:4,each=3),column_gap = unit(0.1,"mm"),
+                                    show_row_names = F, show_column_names=F, cluster_columns = F,
+                                    top_annotation=ha, col=col_fun, column_title="C2/7",
+                                    heatmap_legend_param = list(title="Expr:"))))
+
+} else {
+
+mc.term2gene <- go_list[names(go_list)%in%row.names(mc.dds)]
+
+sm8.GenesDown <- as.integer(mc_res1$padj<0.05 & mc_res1$log2FoldChange < -1); 
+sm8.GenesDown[is.na(sm8.GenesDown)]<-0; 
+names(sm8.GenesDown) <- mc_res1$seqID
+pwf <- nullp(sm8.GenesDown, bias.data = mc_res1$seqLen)
+mc.go.down8 <- goseq(pwf, gene2cat = mc.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mc.go.down8$over_represented_padj <- p.adjust(mc.go.down8$over_represented_pvalue, "BH")
+
+sm8.GenesUp <- as.integer(mc_res1$padj<0.05 & mc_res1$log2FoldChange > 1);
+sm8.GenesUp[is.na(sm8.GenesUp)]<-0;
+names(sm8.GenesUp) <- mc_res1$seqID
+pwf <- nullp(sm8.GenesUp, bias.data = mc_res1$seqLen)
+mc.go.up8 <- goseq(pwf, gene2cat = mc.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mc.go.up8$over_represented_padj <- p.adjust(mc.go.up8$over_represented_pvalue, "BH")
+
+sm12.GenesDown <- as.integer(mc_res2$padj<0.05 & mc_res1$log2FoldChange < -1); 
+sm12.GenesDown[is.na(sm12.GenesDown)]<-0; 
+names(sm12.GenesDown) <- mc_res2$seqID
+pwf <- nullp(sm12.GenesDown, bias.data = mc_res2$seqLen)
+mc.go.down12 <- goseq(pwf, gene2cat = mc.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mc.go.down12$over_represented_padj <- p.adjust(mc.go.down12$over_represented_pvalue, "BH")
+
+sm12.GenesUp <- as.integer(mc_res2$padj<0.05 & mc_res1$log2FoldChange > 1);
+sm12.GenesUp[is.na(sm12.GenesUp)]<-0;
+names(sm12.GenesUp) <- mc_res2$seqID
+pwf <- nullp(sm12.GenesUp, bias.data = mc_res2$seqLen)
+mc.go.up12 <- goseq(pwf, gene2cat = mc.term2gene,test.cats=c("GO:BP")) %>% filter(ontology=="BP")
+mc.go.up12$over_represented_padj <- p.adjust(mc.go.up12$over_represented_pvalue, "BH")
+
+mc.lt <- list(mc.go.down8, mc.go.down12, mc.go.up8, mc.go.up12); names(mc.lt) <- c("DOWN8","DOWN12", "UP8", "UP12")
+#sgo.out <- simplifyGOFromMultipleLists(mc.lt,ont="BP",padj_cutoff = 0.05,
+#                            go_id_column = "category", padj_column = "over_represented_padj",
+#                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")))
+
+mc.met.kegg.list <- lapply(met.kegg[names(met.kegg)%in%row.names(mc.dds)],"[[",2)
+
+pwf <- nullp(sm8.GenesDown, bias.data = mc_res1$seqLen)
+mc.kegg.down8 <- goseq(pwf, gene2cat = mc.met.kegg.list,test.cats=c("KEGG"))
+mc.kegg.down8$over_represented_padj <- p.adjust(mc.kegg.down8$over_represented_pvalue, "BH")
+mc.kegg.down8$pathname <- kegg.names[mc.kegg.down8$category]
+mc.kegg.down8 <- mc.kegg.down8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm8.GenesUp, bias.data = mc_res1$seqLen)
+mc.kegg.up8 <- goseq(pwf, gene2cat = mc.met.kegg.list,test.cats=c("KEGG"))
+mc.kegg.up8$over_represented_padj <- p.adjust(mc.kegg.up8$over_represented_pvalue, "BH")
+mc.kegg.up8$pathname <- kegg.names[mc.kegg.up8$category]
+mc.kegg.up8 <- mc.kegg.up8%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesDown, bias.data = mc_res2$seqLen)
+mc.kegg.down12 <- goseq(pwf, gene2cat = mc.met.kegg.list,test.cats=c("KEGG"))
+mc.kegg.down12$over_represented_padj <- p.adjust(mc.kegg.down12$over_represented_pvalue, "BH")
+mc.kegg.down12$pathname <- kegg.names[mc.kegg.down12$category]
+mc.kegg.down12 <- mc.kegg.down12%>%filter(over_represented_padj<0.05)
+
+pwf <- nullp(sm12.GenesUp, bias.data = mc_res2$seqLen)
+mc.kegg.up12 <- goseq(pwf, gene2cat = mc.met.kegg.list,test.cats=c("KEGG"))
+mc.kegg.up12$over_represented_padj <- p.adjust(mc.kegg.up12$over_represented_pvalue, "BH")
+mc.kegg.up12$pathname <- kegg.names[mc.kegg.up12$category]
+mc.kegg.up12 <- mc.kegg.up12%>%filter(over_represented_padj<0.05)
+
+mc.kegg.up8$type <- "UP8"
+mc.kegg.up12$type <- "UP12"
+mc.kegg.down8$type <- "DOWN8"
+#mc.kegg.down12$type <- "DOWN12"
+mc.kegg <- rbind(mc.kegg.down8, mc.kegg.up8, mc.kegg.down12, mc.kegg.up12)
+mc.kegg$GeneRatio <- mc.kegg$numDEInCat / mc.kegg$numInCat
+mc.kegg$TEMPgroup <- ifelse(mc.kegg$type%in%c("UP8","DOWN8"),8,12)
+mc.kegg$updown <- ifelse(mc.kegg$type%in%c("UP8","UP12"),"UP","DOWN")
+mc.kegg$Strain <- "C2/7"
+
+m.kegg <- rbind(mm.kegg, mc.kegg)
+m.kegg$Temperature <- as.factor(m.kegg$TEMPgroup)
+m.kegg$updown <- factor(m.kegg$updown, levels=c("UP","DOWN"))
+m.kegg$Strain <- as.factor(m.kegg$Strain)
+levels(m.kegg$Strain) <- c("C2/7","M83/4","X11/14","M26/9/10")
+m.kegg.plot <- ggplot(m.kegg, aes(y=reorder(pathname, GeneRatio, mean), fill=Temperature, x=GeneRatio, shape=Strain))+
+  geom_point(position=position_dodge(0.5), aes(size=over_represented_padj,fill=Temperature, shape=Strain),alpha=0.75) + facet_wrap(~updown)+scale_size(name="padj",trans="reverse")+theme_bw()+scale_fill_manual(values=c("8"="blue","12"="red"))+
+  ylab("KEGG metabolic pathway") + scale_shape_manual(values=c("C2/7"=21,"M83/4"=23,"M26/9/10"=22,"X11/14"=24),drop=F)+
+  ggtitle("Male strains") + guides(fill = guide_legend(override.aes = list(fill = c("8"="blue","12"="red"),
+                                                 shape = 21)))
+
+
+}
+```
+
+
+```{r plots, eval=FALSE}
+ragg::agg_tiff(filename="~/hidra/2023/TempAllometry/MS/gene_expression.tiff",
+               width=174,height=115,units="mm",res=300,scaling=0.45)
+ggarrange(
+  ggarrange(mc.v8, mc.v12, mm.v8, mm.v12, ncol=1),  
+  ggarrange(mc.upset, mm.upset, nrow=2),
+  ggarrange(fx.upset, fm.upset, nrow=2),
+  ggarrange(fx.v8, fx.v12, fm.v8, fm.v12, ncol=1),ncol=4,widths=c(1,1.6,1.6,1),labels="AUTO")
+dev.off()
+
+names(mm.lt) <- paste("M83/4", names(mm.lt))
+names(mc.lt) <- paste("C2/7", names(mc.lt))
+m.lt <- c(mc.lt[1],mm.lt[1],mc.lt[2],mm.lt[2],mc.lt[3],mm.lt[3],mc.lt[4],mm.lt[4])
+
+names(fm.lt) <- paste("M26/9/10", names(fm.lt))
+names(fx.lt) <- paste("X11/14", names(fx.lt))
+f.lt <- c(fx.lt[1],fm.lt[1],fx.lt[2],fm.lt[2],fx.lt[3],fm.lt[3],fx.lt[4],fm.lt[4])
+
+source("~/hidra/2023/TempAllometry/diff_expr/sgo_mod.R")
+pdf("~/hidra/2023/TempAllometry/MS/go_enrichment_males.pdf",width=12,height=6)
+male.terms <- simplifyGOFromMultipleLists2(m.lt,ont="BP",padj_cutoff = 0.05,
+                            go_id_column = "category", padj_column = "over_represented_padj",
+                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")),min_term = 10)
+dev.off()
+
+pdf("~/hidra/2023/TempAllometry/MS/go_enrichment_females.pdf",width=12,height=6)
+female.terms <- simplifyGOFromMultipleLists2(f.lt,ont="BP",padj_cutoff = 0.05,
+                            go_id_column = "category", padj_column = "over_represented_padj",
+                            heatmap_param = list(breaks=c(1,0.1,0.05),col=c("white","white","slategrey")),min_term = 10)
+dev.off()
+
+p2<-magick::image_read_pdf("~/hidra/2023/TempAllometry/MS/go_enrichment_males.pdf") %>% image_ggplot()
+p1<-magick::image_read_pdf("~/hidra/2023/TempAllometry/MS/go_enrichment_females.pdf") %>% image_ggplot()
+ggarrange(p2,p1,ncol=1,labels="AUTO")
+ggsave("~/hidra/2023/TempAllometry/MS/go_enrichment.tiff",width=174,units="mm",bg="white")
+
+
+ragg::agg_tiff(filename="~/hidra/2023/TempAllometry/MS/metabolic_kegg.tiff",
+               width=114,height=174,units="mm",res=300,scaling=0.5)
+ggarrange(m.kegg.plot + scale_y_discrete(labels = function(y) stringr::str_wrap(y, width = 20)) +
+            theme(legend.title.align = 1), 
+          f.kegg.plot + scale_y_discrete(labels = function(y) stringr::str_wrap(y, width = 20)) + scale_shape_manual(values=c("M26/9/10"=22,"X11/14"=24)), 
+          nrow=1, labels="AUTO",common.legend=T,legend="top")
+dev.off()
+
+```
+
